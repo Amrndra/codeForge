@@ -1,0 +1,28 @@
+# dependencies
+node_modules/
+
+# env files
+.env
+
+# next.js
+.next/
+
+# logs
+*.log
+
+# build files
+dist/
+build/
+
+# vscode
+.vscode/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# uploaded avatars
+/backend/public/avatars
+
+# uploaded test cases
+/backend/storage/
