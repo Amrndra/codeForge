@@ -30,7 +30,13 @@ const executeViaGlot = async (language, code, stdin = "") => {
     }
 
     const { glotLang, filename } = langConfig;
-    const url = `https://run.glot.io/languages/${glotLang}/versions/latest`;
+    
+    // If GLOT_TOKEN is configured in .env, use the standard authenticated endpoint.
+    // Otherwise fallback to the keyless run.glot.io endpoint.
+    const token = process.env.GLOT_TOKEN;
+    const url = token 
+        ? `https://glot.io/api/run/${glotLang}/latest`
+        : `https://run.glot.io/languages/${glotLang}/versions/latest`;
 
     const payload = {
         files: [
@@ -42,12 +48,17 @@ const executeViaGlot = async (language, code, stdin = "") => {
         stdin: stdin,
     };
 
+    const headers = {
+        "Content-Type": "application/json",
+    };
+    if (token) {
+        headers["Authorization"] = `Token ${token}`;
+    }
+
     try {
         const response = await fetch(url, {
             method: "POST",
-            headers: {
-                "Content-Type": "application/json",
-            },
+            headers: headers,
             body: JSON.stringify(payload),
             signal: AbortSignal.timeout(15_000), // Abort after 15 seconds
         });
