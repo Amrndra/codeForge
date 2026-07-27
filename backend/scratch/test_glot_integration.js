@@ -22,9 +22,14 @@ const executeViaGlot = async (language, code, stdin = "") => {
 
     const { glotLang, filename } = langConfig;
     const token = process.env.GLOT_TOKEN;
-    const url = token 
-        ? `https://glot.io/api/run/${glotLang}/latest`
-        : `https://run.glot.io/languages/${glotLang}/versions/latest`;
+    if (!token) {
+        return {
+            stdout: "",
+            stderr: "",
+            error: "Execution engine config missing. Please set GLOT_TOKEN in your environment or backend/.env.",
+        };
+    }
+    const url = `https://glot.io/api/run/${glotLang}/latest`;
 
     const payload = {
         files: [
@@ -67,6 +72,7 @@ const executeViaGlot = async (language, code, stdin = "") => {
             error: data.error ?? "",
         };
     } catch (err) {
+        console.error("Full fetch error details:", err);
         const isTimeout = err?.name === "TimeoutError" || err?.name === "AbortError";
         return {
             stdout: "",
