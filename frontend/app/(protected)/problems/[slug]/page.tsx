@@ -124,7 +124,12 @@ export default function ProblemPage() {
     lines.push("")
 
     if (!runResult.results.length) {
-      lines.push(runResult.output || "No test cases were provided.")
+      // If output has a real error message, show it. Otherwise generic fallback.
+      lines.push(runResult.output || (
+        runResult.status === "Runtime Error"
+          ? "Execution failed. Check that Docker is running and your code is valid."
+          : "No test cases were provided."
+      ))
       return lines.join("\n")
     }
 

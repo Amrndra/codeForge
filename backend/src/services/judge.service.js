@@ -508,9 +508,17 @@ export const runCode = async ({
     } catch (error) {
         console.error("Run Code Error:", error);
 
+        // Detect common Docker availability error
+        const isDockerUnavailable =
+            error?.code === 'ENOENT' ||
+            error?.code === 'ECONNREFUSED' ||
+            (error?.message && error.message.toLowerCase().includes('docker'));
+
         return {
             status: "Runtime Error",
-            output: "",
+            output: isDockerUnavailable
+                ? "Execution engine unavailable. Docker is not running or inaccessible on this server."
+                : `Execution error: ${error?.message || 'Unknown error'}`,
             results: []
         };
     } finally {
