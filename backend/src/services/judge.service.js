@@ -517,7 +517,7 @@ export const runCode = async ({
         return {
             status: "Runtime Error",
             output: isDockerUnavailable
-                ? "Execution engine unavailable. Docker is not running or inaccessible on this server."
+                ? "Execution engine unavailable. Render free version don't support docker."
                 : `Execution error: ${error?.message || 'Unknown error'}`,
             results: []
         };
