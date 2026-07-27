@@ -1,59 +1,35 @@
 import { ApiError } from "../utils/ApiError.js";
 import Submission from "../models/submission.model.js";
 import Problem from "../models/problem.model.js";
-import { updateContestParticipant } from "./contest.service.js";
+import ContestParticipant from "../models/contestParticipant.model.js";
+import Contest from "../models/contest.model.js";
+import Docker from "dockerode";
 import fs from "fs";
 import path from "path";
+import { updateContestParticipant } from "./contest.service.js";
 
-const mapLanguage = (lang) => {
-    const l = lang.toLowerCase();
-    if (l.includes("c++") || l === "cpp") return "cpp";
-    if (l.includes("java")) return "java";
-    if (l.includes("python") || l === "py") return "python";
-    if (l.includes("javascript") || l === "js") return "javascript";
-    return l;
-};
+const docker = new Docker();
 
-const executePiston = async (language, code, stdin) => {
-    const pistonLang = mapLanguage(language);
-    const response = await fetch("https://emkc.org/api/v2/piston/execute", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-            language: pistonLang,
-            version: "*",
-            files: [
-                {
-                    content: code
-                }
-            ],
-            stdin: stdin
-        })
-    });
-    if (!response.ok) {
-        throw new Error(`Piston API returned status ${response.status}`);
+const parseDockerBuffer = (buffer) => {
+    let stdout = "";
+    let stderr = "";
+    let offset = 0;
+
+    while (offset + 8 <= buffer.length) {
+        const type = buffer.readUInt8(offset);
+        const length = buffer.readUInt32BE(offset + 4);
+        offset += 8;
+
+        if (offset + length > buffer.length) break; // Incomplete chunk
+
+        const payload = buffer.subarray(offset, offset + length).toString("utf-8");
+        if (type === 1) stdout += payload;
+        if (type === 2) stderr += payload;
+
+        offset += length;
     }
-    const data = await response.json();
-    
-    // Check if compilation failed
-    if (data.compile && data.compile.code !== 0) {
-        return {
-            compiled: false,
-            error: data.compile.output || data.compile.stderr,
-            stdout: "",
-            stderr: data.compile.stderr || data.compile.output,
-            code: data.compile.code
-        };
-    }
-    
-    return {
-        compiled: true,
-        stdout: data.run.stdout,
-        stderr: data.run.stderr,
-        code: data.run.code,
-        signal: data.run.signal,
-        output: data.run.output
-    };
+
+    return { stdout, stderr };
 };
 
 const normalizeJudgeText = (value) =>
@@ -71,6 +47,7 @@ const submissionUpdateHelper = async (
         executionTime = null
     }
 ) => {
+
     submission.status = status;
     submission.verdict = verdict;
     if (executionTime !== null) {
@@ -82,7 +59,7 @@ const submissionUpdateHelper = async (
     if (contestId && contestParticipantId) {
         await updateContestParticipant(submission._id, contestId, contestParticipantId);
     }
-};
+}
 
 export const judgeSubmission = async (
     {
@@ -99,137 +76,263 @@ export const judgeSubmission = async (
         throw new ApiError(404, "Submission not found.");
     }
 
+    // Fetch the problem details to get time and memory limits
     const problem = await Problem.findById(submission.problem);
 
     if (!problem) {
         throw new ApiError(404, "Problem not found.");
     }
 
+    const memorylimit = problem.memorylimit; // MB
+
     submission.status = "Judging";
     await submission.save();
 
+    let container;
+
     try {
-        const testcasesDir = path.join(process.cwd(), "storage", "testcases", submission.problem.toString());
-        
-        let testcasesList = [];
 
-        if (fs.existsSync(testcasesDir)) {
-            const files = fs.readdirSync(testcasesDir)
-                .filter(file => file.startsWith("input"))
-                .sort();
-            
-            for (const file of files) {
-                try {
-                    const input = fs.readFileSync(path.join(testcasesDir, file), "utf-8");
-                    const expectedOutput = fs.readFileSync(path.join(testcasesDir, file.replace("input", "output")), "utf-8").trim();
-                    testcasesList.push({ input, expectedOutput });
-                } catch (e) {
-                    console.error("Error reading testcase file:", e);
-                }
-            }
-        }
+        container = await docker.createContainer({
+            Image: "gcc:latest",
 
-        // Fallback to sampleTestCases if no local files found
-        if (testcasesList.length === 0 && problem.sampleTestCases && problem.sampleTestCases.length > 0) {
-            testcasesList = problem.sampleTestCases.map(tc => ({
-                input: tc.input,
-                expectedOutput: tc.output.trim()
-            }));
-        }
+            Cmd: [
+                "tail", "-f", "/dev/null"
+            ],
 
-        if (testcasesList.length === 0) {
-            await submissionUpdateHelper({
-                submission,
-                verdict: "Runtime Error",
-                status: "Failed",
-                contestId,
-                contestParticipantId
-            });
-            return;
-        }
+            Tty: false,
 
-        let allPassed = true;
-        let maxTime = 0;
+            HostConfig: {
+                Memory: memorylimit * 1024 * 1024
+            },
 
-        for (const [index, tc] of testcasesList.entries()) {
-            const start = Date.now();
-            const result = await executePiston(submission.language, submission.code, tc.input);
-            const elapsed = Date.now() - start;
+            AttachStdout: true,
+            AttachStderr: true
+        });
 
-            maxTime = Math.max(maxTime, elapsed);
+        await container.start();
 
-            if (result.compiled === false) {
-                await submissionUpdateHelper({
+        // Compile the code inside the container
+        const exec = await container.exec({
+            Cmd: [
+                "sh",
+                "-c",
+                `cat << EOF > main.cpp
+${submission.code}
+EOF
+
+g++ main.cpp -o main`
+            ],
+            AttachStdout: true,
+            AttachStderr: true
+        });
+
+        const stream = await exec.start();
+
+        let compileOutput = "";
+
+        stream.on("data", (data) => {
+            compileOutput += data.toString();
+        });
+
+        await new Promise((resolve) => {
+            stream.on("end", resolve);
+        });
+
+        const compileResult = await exec.inspect();
+
+        if (compileResult.ExitCode !== 0) {
+            await submissionUpdateHelper(
+                {
                     submission,
                     verdict: "Compilation Error",
                     status: "Completed",
                     contestId,
                     contestParticipantId
-                });
+                }
+            );
+            return;
+        }
+
+
+        // loop through storage/testcases/<problemId>/ and execute the compiled code with each test case and compare the output with the expected output
+        const testcasesDir = path.join(process.cwd(), "storage", "testcases", submission.problem.toString());
+
+        // Ensure the directory exists (auto-create if missing)
+        fs.mkdirSync(testcasesDir, { recursive: true });
+
+        const testcases = fs.readdirSync(testcasesDir)
+            .filter(file => file.startsWith("input"))
+            .sort();
+
+
+        let allPassed = true;
+
+        let maxTime = 0;
+
+        for (const testcase of testcases) {
+            let input = "";
+            let expectedOutput = "";
+            try {
+                input = fs.readFileSync(path.join(testcasesDir, testcase), "utf-8");
+                expectedOutput = fs.readFileSync(path.join(testcasesDir, testcase.replace("input", "output")), "utf-8").trim();
+            }
+            catch (err) {
+                await submissionUpdateHelper(
+                    {
+                        submission,
+                        verdict: "Runtime Error",
+                        status: "Failed",
+                        contestId,
+                        contestParticipantId
+                    }
+                );
                 return;
             }
 
-            if (elapsed > problem.timelimit) {
-                await submissionUpdateHelper({
-                    submission,
-                    verdict: "Time Limit Exceeded",
-                    status: "Completed",
-                    contestId,
-                    contestParticipantId
-                });
+            const timelimit = problem.timelimit / 1000; // seconds
+
+            const start = Date.now();
+            const exec = await container.exec({
+                Cmd: [
+                    "sh",
+                    "-c",
+                    `timeout ${timelimit}s sh -c "printf '%s' '${input}' | ./main"`
+                ],
+                AttachStdout: true,
+                AttachStderr: true
+            });
+
+            const stream = await exec.start();
+
+            let stdout = "";
+            let stderr = "";
+
+            docker.modem.demuxStream(
+                stream,
+                {
+                    write: (chunk) => {
+                        stdout += chunk.toString();
+                    }
+                },
+                {
+                    write: (chunk) => {
+                        stderr += chunk.toString();
+                    }
+                }
+            );
+
+            await new Promise((resolve) => {
+                stream.on("end", resolve);
+            });
+
+            const runResult = await exec.inspect();
+
+            if (runResult.ExitCode === 137) {
+                await submissionUpdateHelper(
+                    {
+                        submission,
+                        verdict: "Memory Limit Exceeded",
+                        status: "Completed",
+                        contestId,
+                        contestParticipantId
+                    }
+                );
                 return;
             }
 
-            if (result.signal === "SIGKILL" || result.code === 137) {
-                await submissionUpdateHelper({
-                    submission,
-                    verdict: "Time Limit Exceeded",
-                    status: "Completed",
-                    contestId,
-                    contestParticipantId
-                });
+            if (runResult.ExitCode === 124) {
+
+                await submissionUpdateHelper(
+                    {
+                        submission,
+                        verdict: "Time Limit Exceeded",
+                        status: "Completed",
+                        contestId,
+                        contestParticipantId
+                    }
+                );
                 return;
             }
 
-            if (result.code !== 0) {
-                await submissionUpdateHelper({
-                    submission,
-                    verdict: "Runtime Error",
-                    status: "Completed",
-                    contestId,
-                    contestParticipantId
-                });
+            if (runResult.ExitCode !== 0) {
+
+                await submissionUpdateHelper(
+                    {
+                        submission,
+                        verdict: "Runtime Error",
+                        status: "Completed",
+                        contestId,
+                        contestParticipantId
+                    }
+                );
                 return;
             }
 
-            const actualOutput = normalizeJudgeText(result.stdout);
-            const expectedOutput = normalizeJudgeText(tc.expectedOutput);
+            const end = Date.now();
 
-            if (actualOutput !== expectedOutput) {
+            maxTime = Math.max(maxTime, end - start);
+
+            const output = stdout.trim();
+
+            console.log("Running testcase:", testcase);
+            console.log("Expected:", JSON.stringify(expectedOutput));
+            console.log("Actual:", JSON.stringify(output));
+
+            if (output !== expectedOutput) {
                 allPassed = false;
                 break;
             }
+
+            console.log("Finished testcase:", testcase);
         }
+        console.log("Finish all testcases!!");
 
-        await submissionUpdateHelper({
-            submission,
-            verdict: allPassed ? "Accepted" : "Wrong Answer",
-            status: "Completed",
-            contestId,
-            contestParticipantId,
-            executionTime: maxTime
-        });
 
-    } catch (error) {
-        console.error("Judge Error:", error);
-        await submissionUpdateHelper({
-            submission,
-            verdict: "Runtime Error",
-            status: "Failed",
-            contestId,
-            contestParticipantId
-        });
+        await submissionUpdateHelper(
+            {
+                submission,
+                verdict: allPassed ? "Accepted" : "Wrong Answer",
+                status: "Completed",
+                contestId, contestParticipantId,
+                executionTime: maxTime
+            }
+        );
+
     }
+    catch (error) {
+
+        console.error(
+            "Judge Error:",
+            error
+        );
+
+        await submissionUpdateHelper(
+            {
+                submission,
+                verdict: "Runtime Error",
+                status: "Failed",
+                contestId,
+                contestParticipantId
+            }
+        );
+
+
+    }
+    finally {
+
+        try {
+
+            if (container) {
+                await container.remove({
+                    force: true
+                });
+            }
+
+        }
+        catch { }
+
+    }
+
 };
 
 export const runCode = async ({
@@ -239,7 +342,72 @@ export const runCode = async ({
     memoryLimit,
     language = "C++"
 } = {}) => {
+    let container;
+
     try {
+        if (language !== "C++") {
+            return {
+                status: "Unsupported Language",
+                output: `${language} is not supported for Run Code yet.`,
+                results: []
+            };
+        }
+
+        container = await docker.createContainer({
+            Image: "gcc:latest",
+            Cmd: ["tail", "-f", "/dev/null"],
+            Tty: false,
+            HostConfig: {
+                Memory: memoryLimit * 1024 * 1024
+            }
+        });
+
+        await container.start();
+
+        const escapedCode = code.replace(/EOF/g, "E_O_F_SAFE");
+
+        const compileExec = await container.exec({
+            Cmd: [
+                "sh",
+                "-c",
+                `printf "%s" "$(cat << 'EOF'\n${escapedCode}\nEOF\n)" > main.cpp && g++ main.cpp -o main`
+            ],
+            AttachStdout: true,
+            AttachStderr: true
+        });
+
+        const compileStream = await compileExec.start();
+
+        let compileOutput = "";
+
+        docker.modem.demuxStream(
+            compileStream,
+            {
+                write: (chunk) => {
+                    compileOutput += chunk.toString();
+                }
+            },
+            {
+                write: (chunk) => {
+                    compileOutput += chunk.toString();
+                }
+            }
+        );
+
+        await new Promise((resolve) =>
+            compileStream.on("end", resolve)
+        );
+
+        const compileResult = await compileExec.inspect();
+
+        if (compileResult.ExitCode !== 0) {
+            return {
+                status: "Compilation Error",
+                output: compileOutput,
+                results: []
+            };
+        }
+
         const results = [];
         const cases = Array.isArray(testCases) ? testCases : [];
 
@@ -247,20 +415,48 @@ export const runCode = async ({
             const expectedOutput = typeof tc.output === "string"
                 ? normalizeJudgeText(tc.output)
                 : null;
+            const safeInput = String(tc.input ?? "").replace(/'/g, "'\\''");
 
-            const start = Date.now();
-            const result = await executePiston(language, code, tc.input);
-            const elapsed = Date.now() - start;
+            const runExec = await container.exec({
+                Cmd: [
+                    "sh",
+                    "-c",
+                    `printf '%s' '${safeInput}' | timeout ${timeLimit}s ./main`
+                ],
+                AttachStdout: true,
+                AttachStderr: true
+            });
 
-            if (result.compiled === false) {
-                return {
-                    status: "Compilation Error",
-                    output: result.error,
-                    results: []
-                };
+            const stream = await runExec.start();
+
+            // Collect raw stream data into an array of buffers
+            const chunks = [];
+            stream.on("data", (chunk) => {
+                chunks.push(chunk);
+            });
+
+            await new Promise((resolve) =>
+                stream.on("end", resolve)
+            );
+
+            // Combine all chunks and parse out the headers
+            const fullBuffer = Buffer.concat(chunks);
+            const { stdout, stderr } = parseDockerBuffer(fullBuffer);
+
+            const runResult = await runExec.inspect();
+
+            if (runResult.ExitCode === 137) {
+                results.push({
+                    index,
+                    status: "Memory Limit Exceeded",
+                    input: tc.input,
+                    expectedOutput,
+                    output: ""
+                });
+                break;
             }
 
-            if (elapsed > (timeLimit * 1000)) {
+            if (runResult.ExitCode === 124) {
                 results.push({
                     index,
                     status: "Time Limit Exceeded",
@@ -271,29 +467,18 @@ export const runCode = async ({
                 break;
             }
 
-            if (result.signal === "SIGKILL" || result.code === 137) {
-                results.push({
-                    index,
-                    status: "Time Limit Exceeded",
-                    input: tc.input,
-                    expectedOutput,
-                    output: ""
-                });
-                break;
-            }
-
-            if (result.code !== 0) {
+            if (runResult.ExitCode !== 0) {
                 results.push({
                     index,
                     status: "Runtime Error",
                     input: tc.input,
                     expectedOutput,
-                    output: normalizeJudgeText(result.stderr || result.output)
+                    output: normalizeJudgeText(stderr)
                 });
                 break;
             }
 
-            const actualOutput = normalizeJudgeText(result.stdout);
+            const actualOutput = normalizeJudgeText(stdout);
             const isAccepted = expectedOutput === null
                 ? true
                 : expectedOutput === actualOutput;
@@ -322,10 +507,25 @@ export const runCode = async ({
         };
     } catch (error) {
         console.error("Run Code Error:", error);
+
+        // Detect common Docker availability error
+        const isDockerUnavailable =
+            error?.code === 'ENOENT' ||
+            error?.code === 'ECONNREFUSED' ||
+            (error?.message && error.message.toLowerCase().includes('docker'));
+
         return {
             status: "Runtime Error",
-            output: `Execution error: ${error?.message || 'Unknown error'}`,
+            output: isDockerUnavailable
+                ? "Execution engine unavailable. Docker is not running or inaccessible on this server."
+                : `Execution error: ${error?.message || 'Unknown error'}`,
             results: []
         };
+    } finally {
+        try {
+            if (container) {
+                await container.remove({ force: true });
+            }
+        } catch { }
     }
 };
