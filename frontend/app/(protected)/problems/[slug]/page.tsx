@@ -84,6 +84,7 @@ export default function ProblemPage() {
   const [sampleTestCases, setSampleTestCases] = useState<TestCase[]>([])
   const [customTestCases, setCustomTestCases] = useState<TestCase[]>([{ input: "", output: "" }])
   const [isRunning, setIsRunning] = useState(false)
+  const [isSubmitting, setIsSubmitting] = useState(false)
   const searchParams = useSearchParams();
   const returnTo = searchParams.get("returnTo") ?? "/problems";
   const contestId = searchParams.get("contestId");
@@ -247,8 +248,20 @@ export default function ProblemPage() {
   }
 
   const pollSubmission = (submissionId: string) => {
+    const MAX_POLL_MS = 60_000; // stop polling after 60 seconds
+    const startedAt = Date.now();
+
     const interval = setInterval(async () => {
       try {
+        if (Date.now() - startedAt > MAX_POLL_MS) {
+          clearInterval(interval);
+          setIsSubmitting(false);
+          setOutput(
+            `Status: Timed Out\n\nThe judge did not respond within 60 seconds.\nThe worker may be unavailable or the server is cold-starting. Please try again.`
+          );
+          return;
+        }
+
         const res = await apiFetch(`/submissions/${submissionId}`);
 
         const submission = res.data.submission;
@@ -267,6 +280,7 @@ export default function ProblemPage() {
         }
 
         clearInterval(interval);
+        setIsSubmitting(false);
 
         setOutput(
   `Verdict: ${submission.verdict}
@@ -277,6 +291,7 @@ export default function ProblemPage() {
         );
       } catch (err: any) {
         clearInterval(interval);
+        setIsSubmitting(false);
         setOutput(err.message);
       }
     }, 1500);
@@ -368,6 +383,7 @@ export default function ProblemPage() {
 
     try {
       setActivePanel("output");
+      setIsSubmitting(true);
       setOutput("Submitting solution...");
 
       const submitRes = await apiFetch(
@@ -382,7 +398,6 @@ export default function ProblemPage() {
           }),
         }
       );
-      console.log("Submission response:", submitRes);
       const submissionId = submitRes.data.submissionId;
 
       setOutput(`Submission queued...\nSubmission ID: ${submissionId}`);
@@ -390,6 +405,7 @@ export default function ProblemPage() {
       pollSubmission(submissionId);
 
     } catch (err: any) {
+      setIsSubmitting(false);
       setOutput(err.message);
     }
   };
@@ -777,9 +793,11 @@ export default function ProblemPage() {
                 Run
               </Button>
 
-              <Button onClick={handleSubmit}>
-                <Send className="mr-2 h-4 w-4" />
-                Submit
+              <Button onClick={handleSubmit} disabled={isSubmitting}>
+                {isSubmitting
+                  ? <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                  : <Send className="mr-2 h-4 w-4" />}
+                {isSubmitting ? "Judging..." : "Submit"}
               </Button>
 
             </div>
