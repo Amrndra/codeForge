@@ -1,6 +1,6 @@
 import * as authStore from './authStore'
 
-const API_URL = process.env.NEXT_PUBLIC_API_URL || ''
+const API_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:5000'
 
 function isFormData(body: any) {
     return typeof FormData !== 'undefined' && body instanceof FormData
