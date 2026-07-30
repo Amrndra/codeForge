@@ -56,7 +56,7 @@ CodeForge uses a decoupled, asynchronous producer-consumer architecture to keep 
 [ User Submission ] ➔ [ Next.js Frontend ] ➔ [ Express API ] ➔ [ BullMQ Queue ] ➔ [ Redis ] ➔ [ Docker Workers ] ➔ [ MongoDB ]
 ```
 
-![CodeForge Architecture](assets/architecture.svg)
+
 
 * **Asynchronous Queueing:** Submissions are immediately acknowledged while BullMQ and Redis queue the evaluation work.
 * **Sandboxed Execution:** User code is compiled and executed in ephemeral, isolated Docker containers.
